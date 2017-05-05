@@ -26,6 +26,7 @@ from ansible.module_utils._text import to_text
 from ansible.playbook.play_context import MAGIC_VARIABLE_MAPPING
 from ansible.plugins.action import ActionBase
 from ansible.plugins import connection_loader
+from ansible.errors import AnsibleError
 
 boolean = C.mk_boolean
 
@@ -133,6 +134,15 @@ class ActionModule(ActionBase):
             if key.startswith("ansible_") and key.endswith("_interpreter"):
                 task_vars[key] = localhost[key]
 
+    def get_jail_uuid(self, iocage):
+        jail = self._low_level_execute_command(u"iocage get host_hostuuid {}".format(iocage))
+        stdout = jail['stdout']
+
+        if jail['rc'] != 0:
+            raise AnsibleError(u"Unable to determine uuid of iocage: {}".format(stdout))
+
+        return "ioc-{}".format(stdout.rstrip())
+
     def run(self, tmp=None, task_vars=None):
         ''' generates params and passes them on to the rsync module '''
         # When modifying this function be aware of the tricky convolutions
@@ -164,6 +174,25 @@ class ActionModule(ActionBase):
         # retry. If that happens we don't want to pass the munged args through
         # to our next invocation. Munged args are single use only.
         _tmp_args = self._task.args.copy()
+
+	##############
+	# TrueSpeed
+	# If the connection is targeting a jail on the host target the iocage's rsync on the host instead.
+	##############
+
+        if self._connection.transport == 'sshjail':
+            _iocage = self._connection.jailspec
+            _real_ssh_host = self._connection.host
+
+            self._play_context.remote_addr = _real_ssh_host
+            new_connection = connection_loader.get('ssh', self._play_context, self._connection._new_stdin)
+            self._connection = new_connection
+
+	    _jailid = self.get_jail_uuid(_iocage)
+            _tmp_args['rsync_path'] = "jailme {} rsync".format(_jailid)
+
+            if self._play_context.become:
+                _tmp_args['rsync_path'] = "sudo {}".format(_tmp_args['rsync_path'])
 
         result = super(ActionModule, self).run(tmp, task_vars)
 
@@ -214,6 +243,12 @@ class ActionModule(ActionBase):
             dest_host = dest_host_inventory_vars['ansible_host']
         except KeyError:
             dest_host = dest_host_inventory_vars.get('ansible_ssh_host', inventory_hostname)
+
+        #############
+        # TrueSpeed
+        #############
+        if _real_ssh_host is not None:
+            dest_host = _real_ssh_host
 
         localhost_ports = set()
         for host in C.LOCALHOST:
